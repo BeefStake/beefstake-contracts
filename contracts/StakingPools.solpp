@@ -75,6 +75,7 @@ contract StakingPools is Owned, SBPVoter {
     struct UserInfo {
         uint stakingBalance;
         uint rewardDebt;
+        uint depositBlock;
     }
 
     /// @notice Container for per-pool settings and state.
@@ -104,6 +105,8 @@ contract StakingPools is Owned, SBPVoter {
         uint rewardPerPeriod;
         uint rewardPerToken;
         uint paidOut;
+        uint removedDecimals;
+        uint timelock;
     }
 
     // EVENTS
@@ -157,6 +160,14 @@ contract StakingPools is Owned, SBPVoter {
         _updatePool(PoolId);
         require(msg.tokenid == pool.stakingTokenId); // token sent does not match staking pool
         require(block.number <= pool.endBlock);      // prevent deposit if pool closed
+        require(msg.amount > 0);
+
+        if(block.number < pool.startBlock){
+            user.depositBlock = pool.startBlock;
+        }else{
+            user.depositBlock = block.number;
+        }
+        
 
         // dispense rewards
         if (user.stakingBalance > 0) {
@@ -165,10 +176,11 @@ contract StakingPools is Owned, SBPVoter {
             if( pendingAmount > 0 ){
                 /// @dev redundant with safemath pool.currentRewardBalance.sub(pendingAmount) below.
                 require( pendingAmount <= pool.currentRewardBalance );
-                msg.sender.transfer(pool.rewardTokenId, pendingAmount);		
+                uint realPendingAmount = pendingAmount * pool.removedDecimals;
+                msg.sender.transfer(pool.rewardTokenId, realPendingAmount);		
                 pool.currentRewardBalance = pool.currentRewardBalance.sub(pendingAmount);
                 pool.paidOut = pool.paidOut.add(pendingAmount);
-                emit Claim(msg.sender, PoolId, pendingAmount);
+                emit Claim(msg.sender, PoolId, realPendingAmount);
             }
         }
 
@@ -196,51 +208,75 @@ contract StakingPools is Owned, SBPVoter {
         if( pendingAmount > 0 ){
             /// @dev redundant with safemath pool.currentRewardBalance.sub(pendingAmount) below.
             require( pendingAmount <= pool.currentRewardBalance ); 
-            msg.sender.transfer(pool.rewardTokenId, pendingAmount);
+            uint realPendingAmount = pendingAmount * pool.removedDecimals;
+            msg.sender.transfer(pool.rewardTokenId, realPendingAmount);
             pool.currentRewardBalance = pool.currentRewardBalance.sub(pendingAmount);
             pool.paidOut = pool.paidOut.add(pendingAmount);
-            emit Claim(msg.sender, PoolId, pendingAmount);
+            emit Claim(msg.sender, PoolId, realPendingAmount);
+        }
+
+        uint realAmount = amount;
+        if(
+            block.number >= pool.startBlock && //if the pool hasn't started, let the user withdraw
+            user.depositBlock + pool.timelock > block.number && // timelock
+            block.number <= pool.endBlock // if the pool is ended, don't apply timelock
+        ){
+            // timelock
+            realAmount = 0;
         }
 
         // update balances & recompute rewardDebt
-        user.stakingBalance = user.stakingBalance.sub(amount);
-        pool.totalStakingBalance = pool.totalStakingBalance.sub(amount);
+        user.stakingBalance = user.stakingBalance.sub(realAmount);
+        pool.totalStakingBalance = pool.totalStakingBalance.sub(realAmount);
         /// @dev ATTENTION: rewardDebt has possibility to round down here, most dangerous line of code?
         user.rewardDebt = user.stakingBalance.mul(pool.rewardPerToken).div(1e36);
         
-        // send withdrawn funds
-        msg.sender.transfer(pool.stakingTokenId, amount);
-        
-        emit Withdraw(msg.sender, PoolId, amount);        
+        // if the user chooses to withdraw nothing, just to claim rewards
+        // we'll use 1 quota UT for nothing if we don't do this
+        if(realAmount > 0){
+            // send withdrawn funds
+            msg.sender.transfer(pool.stakingTokenId, realAmount);
+            
+            emit Withdraw(msg.sender, PoolId, realAmount);
+        }     
     }
 
     
     onMessage createStakingPool(
         uint startBlock,
         uint endBlock,
-        tokenId stakingTokenId
+        tokenId stakingTokenId,
+        uint removedDecimals,
+        uint timelock
     )
         payable
     {
         require(msg.sender == owner); // must be owner
         require(startBlock < endBlock); // start time must be before end time
         require(block.number < startBlock); // start time cannot be in the past
-        require(msg.amount < 1e35);  // prevent potential issues with large supply tokens
-        require(msg.amount > 1e10);   // prevent potential issues with small supply tokens
+        require(removedDecimals < 76); // don't let it overflow
+        uint factor = 10 ** removedDecimals;
+        uint amount = msg.amount / factor;
+        require(amount * factor == msg.amount); // no rounded down dust
+        require(amount < 1e35);  // prevent potential issues with large supply tokens
+        require(amount > 1e10);   // prevent potential issues with small supply tokens
+        require(timelock < 365*24*60*60); // require timelock less than a year
         emit PoolCreated(poolCount); // emit PoolId of new pool.
         PoolInfo storage pool = pools[poolCount++];
         pool.stakingTokenId = stakingTokenId;
         pool.rewardTokenId = msg.tokenid; // reward tokenId determined by funds sent
         pool.totalStakingBalance = 0;
-        pool.totalRewardBalance = msg.amount;
-        pool.currentRewardBalance = msg.amount;
+        pool.totalRewardBalance = amount;
+        pool.currentRewardBalance = amount;
         pool.startBlock = startBlock;
         pool.endBlock = endBlock;
         pool.latestRewardBlock = startBlock;
         /// @dev rewardPerPeriod has the potential to round down here potentially allowing for some dust.
-        pool.rewardPerPeriod = msg.amount.div(endBlock.sub(startBlock));
+        pool.rewardPerPeriod = amount.div(endBlock.sub(startBlock));
         pool.rewardPerToken = 0;
         pool.paidOut = 0;
+        pool.removedDecimals = factor;
+        pool.timelock = timelock;
     }
 
     /// @notice Add additional funds to the pool, increases endBlock keeping rewardPerPeriod constant.
@@ -250,14 +286,16 @@ contract StakingPools is Owned, SBPVoter {
         PoolInfo storage pool = pools[PoolId];
         require(block.number < pool.endBlock); // can't fund an ended pool
         require(msg.tokenid == pool.rewardTokenId); // wrong tokenId deposited
-        require(msg.amount > 1e10); // must send tokens to deposit, prevent issues with small token amounts       
+        uint amount = msg.amount / pool.removedDecimals;
+        require(amount * pool.removedDecimals == msg.amount); // prevent dust
+        require(amount > 1e10); // must send tokens to deposit, prevent issues with small token amounts       
         /// @dev endBlockIncrease has the potential to round down here allowing for some dust.
-        uint endBlockIncrease = msg.amount.div(pool.rewardPerPeriod);
+        uint endBlockIncrease = amount.div(pool.rewardPerPeriod);
         require(endBlockIncrease > 0); // not enough tokens added to increase pool duration
-        pool.totalRewardBalance = pool.totalRewardBalance.add(msg.amount);
+        pool.totalRewardBalance = pool.totalRewardBalance.add(amount);
         /// @dev Prevent potential issues with large supply tokens.
         require(pool.totalRewardBalance < 1e35); // too many tokens added
-        pool.currentRewardBalance = pool.currentRewardBalance.add(msg.amount);
+        pool.currentRewardBalance = pool.currentRewardBalance.add(amount);
         pool.endBlock += endBlockIncrease;
     }
 
@@ -269,8 +307,9 @@ contract StakingPools is Owned, SBPVoter {
         require(pool.currentRewardBalance > 0); // can't withdraw if no tokens left
         /// @dev redundant with require(pool.currentRewardBalance > 0);
         require(pool.paidOut < pool.totalRewardBalance); // must not have paid out all rewards
-        msg.sender.transfer(pool.rewardTokenId, pool.currentRewardBalance);
-        pool.paidOut = pool.paidOut.add(pool.currentRewardBalance);
+        uint rewardBalance = pool.currentRewardBalance * pool.removedDecimals;
+        msg.sender.transfer(pool.rewardTokenId, rewardBalance);
+        pool.paidOut = pool.paidOut.add(rewardBalance);
         pool.currentRewardBalance = 0;
     }
 
@@ -296,12 +335,14 @@ contract StakingPools is Owned, SBPVoter {
     getter getUserInfo(uint PoolId, address addr)
         returns (
             uint stakingBalance,
-            uint rewardDebt
+            uint rewardDebt,
+            uint depositBlock
         )
     {
         return (
             pools[PoolId].userInfo[addr].stakingBalance,
-            pools[PoolId].userInfo[addr].rewardDebt
+            pools[PoolId].userInfo[addr].rewardDebt,
+            pools[PoolId].userInfo[addr].depositBlock
         );
     }
 
@@ -316,7 +357,9 @@ contract StakingPools is Owned, SBPVoter {
             uint latestRewardBlock,
             uint rewardPerPeriod,
             uint rewardPerToken,
-            uint paidOut
+            uint paidOut,
+            uint removedDecimals,
+            uint timelock
         )
     {
         PoolInfo storage pool = pools[PoolId];
@@ -330,7 +373,9 @@ contract StakingPools is Owned, SBPVoter {
             pool.latestRewardBlock,
             pool.rewardPerPeriod,
             pool.rewardPerToken,
-            pool.paidOut
+            pool.paidOut,
+            pool.removedDecimals,
+            pool.timelock
         );
     }
 
@@ -344,20 +389,22 @@ contract StakingPools is Owned, SBPVoter {
     {
         tokenId[] memory _stakingTokenIds = new tokenId[](poolCount);
         tokenId[] memory _rewardTokenIds = new tokenId[](poolCount);
-        uint[] memory _packedIntegers = new uint[](poolCount*8);
+        uint[] memory _packedIntegers = new uint[](poolCount*10);
 
         for (uint i = 0; i < poolCount; i++) {
             PoolInfo storage pool = pools[i];
             _stakingTokenIds[i] = pool.stakingTokenId;
             _rewardTokenIds[i] = pool.rewardTokenId;
-            _packedIntegers[i*8+0] = pool.totalStakingBalance;
-            _packedIntegers[i*8+1] = pool.totalRewardBalance;
-            _packedIntegers[i*8+2] = pool.startBlock;
-            _packedIntegers[i*8+3] = pool.endBlock;
-            _packedIntegers[i*8+4] = pool.latestRewardBlock;
-            _packedIntegers[i*8+5] = pool.rewardPerPeriod;
-            _packedIntegers[i*8+6] = pool.rewardPerToken;
-            _packedIntegers[i*8+7] = pool.paidOut;
+            _packedIntegers[i*10+0] = pool.totalStakingBalance;
+            _packedIntegers[i*10+1] = pool.totalRewardBalance;
+            _packedIntegers[i*10+2] = pool.startBlock;
+            _packedIntegers[i*10+3] = pool.endBlock;
+            _packedIntegers[i*10+4] = pool.latestRewardBlock;
+            _packedIntegers[i*10+5] = pool.rewardPerPeriod;
+            _packedIntegers[i*10+6] = pool.rewardPerToken;
+            _packedIntegers[i*10+7] = pool.paidOut;
+            _packedIntegers[i*10+8] = pool.removedDecimals;
+            _packedIntegers[i*10+9] = pool.timelock;
         }
         return (_stakingTokenIds, _rewardTokenIds, _packedIntegers);
     }
